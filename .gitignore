@@ -1,0 +1,24 @@
+# --- 数据文件 (严禁上传，动辄数GB) ---
+data/
+*.pcd
+*.npz
+*.npy
+
+# --- 模型权重 (GitHub单文件限制100MB) ---
+pretrained_models/*.pth
+pretrained_models/*.pt
+
+# --- 训练记录与结果 ---
+logs/
+data/inference_vis_full/
+data/frame_packages_full/
+
+# --- Python 环境与缓存 ---
+__pycache__/
+.env
+.venv
+.ipynb_checkpoints/
+
+# --- IDE 配置文件 ---
+.vscode/
+.idea/
