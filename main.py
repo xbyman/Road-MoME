@@ -19,7 +19,7 @@ STEPS = {
     "extract_2d": True,  # 3. 2D 视觉特征提取 (1_extract_2d_dinov2)
     "extract_3d": True,  # 4. 3D 深度特征提取 (2_extract_3d_deep)
     "train": True,  # 5. MoME 模型训练 (3_train_mome)
-    "vis": False,  # 6. 推理结果可视化 (4_inference_vis)
+    "vis": True,  # 6. 推理结果可视化 (4_inference_vis)
 }
 # =====================================================
 

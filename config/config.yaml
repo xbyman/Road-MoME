@@ -1,6 +1,6 @@
 # ==========================================
 # 路面多模态协同异常检测 (MoME) 全局配置
-# 版本: v3.2 (坐标复位至 [-8.0, 0.0] 版)
+# 版本: v3.3 (协同版专用校准)
 # ==========================================
 
 # 1. 路径管理
@@ -17,26 +17,24 @@ paths:
   weights:
     point_mae: "C:/Users/31078/Desktop/ROAD/pretrained_models/pretrain.pth"
     dinov2: "C:/Users/31078/Desktop/ROAD/pretrained_models/dinov2_vitb14_pretrain.pth"
+    # 💡 训练完成后，确认此路径指向最新的 best 模型
     mome_model: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_best.pth"
 
-# 2. 预处理配置
-# ------------------------------------------
-preprocess:
-  inference_batch_size: 8      
-  num_workers: 0               
-  skip_existing: true          
-
-# 3. 训练与实验管理
+# 2. 训练配置 (针对协同专家调优)
 # ------------------------------------------
 train:
-  experiment_name: "MoME_v2_Baseline_Y8" # 增加后缀以区分新的 ROI 范围
+  experiment_name: "MoME_v2_Synergy_Full" # 每次新实验建议修改此名称
   seed: 42                            
+  
   epochs: 50
   batch_size: 32
   lr: 0.0001
   pos_weight: 5.0                     
   val_split: 0.2
-  modal_mask_prob: 0.3                
+  
+  # 💡 专家屏蔽概率 (ModalMask)
+  # 设为 0.2 代表 20% 概率屏蔽物理输入，强制 3D/2D 协同学习
+  modal_mask_prob: 0.2 
 
   resume: false                       
   resume_path: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_best.pth"
@@ -48,16 +46,18 @@ train:
     ignore_corrupt: true
     min_patch_count: 5
 
-# 4. 特征维度与几何参数 (校准 ROI_Y 为 [-8.0, 0])
+# 3. 特征维度与几何参数 (校准 ROI_Y 为 [-8.0, 0])
 # ------------------------------------------
 features:
   phys: { key_name: "phys_8d", input_dim: 8 }
   3d:   { key_name: "deep_512d", input_dim: 384 }
   2d:   { key_name: "deep_2d_768d", input_dim: 768 }
+  # 协同特征在模型内部对齐至 128 维，此处作为参考
+  shared_dim: 128 
 
 geometry:
   roi_x: [-3.0, 3.0]
-  roi_y: [-8.0, 0.0]       # 💡 已根据要求复位
+  roi_y: [-8.0, 0.0]
   roi_z: [-1.0, 1.0]
   patch_size: 1.0
   overlap: 0.2
@@ -69,7 +69,7 @@ sampling:
   k_z_stretch: 10.0
   trans_dim: 384
 
-# 5. 推理控制
+# 4. 推理控制
 # ------------------------------------------
 inference:
   mode: "random" 

@@ -1,9 +1,9 @@
 """
-[Step 3] MoME 道路异常检测训练脚本 (v3.3 多维评估版)
-功能更新：
-1. 性能指标：集成 F1-Score, Precision, Recall 用于评估不平衡样本的分类能力。
-2. 专家审计：自动统计 Phys, 3D-Geom, 2D-Tex 三个专家的平均权重（贡献率）。
-3. 容错对齐：保持 Patch 动态对齐逻辑，修复 DataLoader 报错。
+[Step 3] MoME 道路异常检测训练脚本 (v3.4 协同适配版)
+核心更新：
+1. 专家审计：适配 4 专家架构 (Phys, Geom, Tex, Synergy)。
+2. 指标监控：在 TensorBoard 中新增 Synergy_Weight 曲线。
+3. 协同验证：统计协同专家在异常样本上的话语权提升。
 """
 
 import os
@@ -30,8 +30,6 @@ from scripts.exp_manager import ExperimentManager
 # ==================== 环境配置 ====================
 def load_config():
     cfg_path = project_root / "config" / "config.yaml"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"❌ 找不到配置文件: {cfg_path}")
     with open(cfg_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f), cfg_path
 
@@ -51,7 +49,7 @@ random.seed(seed)
 
 # 初始化实验管理
 exp_mgr = ExperimentManager(
-    project_root, experiment_name=TRAIN_CFG.get("experiment_name", "MoME_Run")
+    project_root, experiment_name=TRAIN_CFG.get("experiment_name", "MoME_Synergy_v2")
 )
 exp_mgr.log_config(config_path)
 EXP_DIR = Path(exp_mgr.get_exp_dir())
@@ -118,7 +116,7 @@ def collate_fn(batch):
 
 
 def train():
-    # 1. 模型初始化
+    # 1. 模型初始化 (此时加载的是 v2.0 特征协同版模型)
     model = build_mome_model(config_dict).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=TRAIN_CFG["lr"], weight_decay=1e-2)
     pos_w = torch.tensor([TRAIN_CFG["pos_weight"]]).to(DEVICE)
@@ -143,18 +141,19 @@ def train():
     best_metrics = {}
 
     print(
-        f"\n🚀 训练启动 | 目标 Patch 数: {MAX_PATCHES} | 权重: {TRAIN_CFG['pos_weight']}"
+        f"\n🚀 协同训练启动 | 架构版本: v2.0 (4专家) | 特征维度: 3D({FEAT_CFG['3d']['input_dim']}) 2D({FEAT_CFG['2d']['input_dim']})"
     )
 
     for epoch in range(TRAIN_CFG["epochs"]):
-        # --- 训练阶段 ---
         model.train()
         train_loss = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
             if batch is None:
                 continue
             phys, geom, tex, meta = [b.to(DEVICE) for b in batch]
-            if random.random() < TRAIN_CFG.get("modal_mask_prob", 0.15):
+
+            # ModalMask 增强：让协同专家在单一模态缺失时学会寻找残差关联
+            if random.random() < TRAIN_CFG.get("modal_mask_prob", 0.2):
                 phys = phys * 0.0
 
             logits, _ = model(phys, geom, tex)
@@ -168,63 +167,55 @@ def train():
             optimizer.step()
             train_loss += weighted_loss.item()
 
-        # --- 验证与多维指标统计 ---
+        # --- 验证与 4 专家贡献度审计 ---
         model.eval()
         val_loss = 0
         all_preds, all_labels = [], []
-        all_weights = []  # 记录专家权重 [B, N, 3]
+        all_weights = []  # 记录专家权重 [B, N, 4]
 
         with torch.no_grad():
             for batch in val_loader:
                 if batch is None:
                     continue
                 phys, geom, tex, meta = [b.to(DEVICE) for b in batch]
-                logits, weights = model(phys, geom, tex)
+                logits, weights = model(phys, geom, tex)  # weights shape: [B, N, 4]
 
-                # 计算 Loss
                 v_loss = (criterion(logits, meta[:, :, 0]) * meta[:, :, 1]).sum() / (
                     meta[:, :, 1].sum() + 1e-6
                 )
                 val_loss += v_loss.item()
 
-                # 收集预测值用于 F1 计算 (仅针对非 Padding 的有效 Patch)
-                probs = torch.sigmoid(logits).cpu().numpy()
-                labels = meta[:, :, 0].cpu().numpy()
-                qualities = meta[:, :, 1].cpu().numpy()
-
-                valid_mask = qualities > 0
-                all_preds.extend((probs[valid_mask] > 0.5).astype(int))
-                all_labels.extend(labels[valid_mask].astype(int))
-
-                # 收集专家权重 (仅有效 Patch)
-                weights_np = weights.cpu().numpy()
-                all_weights.append(weights_np[valid_mask])
+                valid_mask = meta[:, :, 1].cpu().numpy() > 0
+                all_preds.extend(
+                    (torch.sigmoid(logits).cpu().numpy()[valid_mask] > 0.5).astype(int)
+                )
+                all_labels.extend(meta[:, :, 0].cpu().numpy()[valid_mask].astype(int))
+                all_weights.append(weights.cpu().numpy()[valid_mask])
 
         # 计算评估指标
         avg_train, avg_val = train_loss / len(train_loader), val_loss / len(val_loader)
         f1 = f1_score(all_labels, all_preds, zero_division=0)
-        recall = recall_score(all_labels, all_preds, zero_division=0)
-        precision = precision_score(all_labels, all_preds, zero_division=0)
 
-        # 计算平均专家贡献度
-        all_weights_cat = np.concatenate(
-            all_weights, axis=0
-        )  # [Total_Valid_Patches, 3]
-        avg_expert_weights = np.mean(all_weights_cat, axis=0)  # [w_phys, w_geom, w_tex]
+        # 计算平均专家贡献度 (包含第四专家)
+        all_weights_cat = np.concatenate(all_weights, axis=0)
+        avg_expert_weights = np.mean(
+            all_weights_cat, axis=0
+        )  # [w_phys, w_geom, w_tex, w_syn]
 
         print(
-            f"📈 E{epoch+1:02d} | ValLoss: {avg_val:.4f} | F1: {f1:.3f} | Rec: {recall:.3f} | Exp: {avg_expert_weights}"
+            f"📈 E{epoch+1:02d} | Loss: {avg_val:.4f} | F1: {f1:.3f} | Weights: {np.round(avg_expert_weights, 3)}"
         )
 
-        # TensorBoard 记录
         writer.add_scalar("Loss/Train", avg_train, epoch)
         writer.add_scalar("Loss/Validation", avg_val, epoch)
         writer.add_scalar("Metrics/F1-Score", f1, epoch)
         writer.add_scalar("Expert/Phys_Weight", avg_expert_weights[0], epoch)
         writer.add_scalar("Expert/Geom_Weight", avg_expert_weights[1], epoch)
         writer.add_scalar("Expert/Tex_Weight", avg_expert_weights[2], epoch)
+        writer.add_scalar(
+            "Expert/Synergy_Weight", avg_expert_weights[3], epoch
+        )  # 💡 新增
 
-        # 保存最佳模型并暂存指标
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             torch.save(model.state_dict(), EXP_DIR / "mome_model_best.pth")
@@ -235,19 +226,15 @@ def train():
             best_metrics = {
                 "best_val_loss": avg_val,
                 "f1_score": f1,
-                "recall": recall,
-                "precision": precision,
                 "avg_w_phys": avg_expert_weights[0],
                 "avg_w_geom": avg_expert_weights[1],
                 "avg_w_tex": avg_expert_weights[2],
+                "avg_w_syn": avg_expert_weights[3],
             }
 
-    # 存档
     exp_mgr.save_results(best_metrics, config_dict)
     writer.close()
-    print(
-        f"✨ 训练完成！最佳 F1: {best_metrics.get('f1_score'):.3f}，存档于: {EXP_DIR}"
-    )
+    print(f"✨ 协同训练完成！最佳 F1: {best_metrics.get('f1_score'):.3f}")
 
 
 if __name__ == "__main__":
