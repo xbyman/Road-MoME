@@ -37,7 +37,7 @@ def load_config():
             },
             "geometry": {
                 "roi_x": [-3.0, 3.0],
-                "roi_y": [-5.0, -1.0],
+                "roi_y": [-8.0, 0],
                 "patch_size": 1.0,
                 "overlap": 0.2,
                 "th_anomaly": 0.035,

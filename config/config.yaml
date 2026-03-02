@@ -1,6 +1,6 @@
 # ==========================================
 # 路面多模态协同异常检测 (MoME) 全局配置
-# 版本: v2.8 (显存保护与检查增强版)
+# 版本: v3.2 (坐标复位至 [-8.0, 0.0] 版)
 # ==========================================
 
 # 1. 路径管理
@@ -19,31 +19,36 @@ paths:
     dinov2: "C:/Users/31078/Desktop/ROAD/pretrained_models/dinov2_vitb14_pretrain.pth"
     mome_model: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_best.pth"
 
-# 2. 预处理与推理引擎配置 (针对 8GB 显存与效率优化)
+# 2. 预处理配置
 # ------------------------------------------
 preprocess:
-  inference_batch_size: 8      # 显存保护的核心，若 8 依然卡顿请改 4
-  num_workers: 0               # 设为 0 避免多进程拷贝导致的内存压力
-  skip_existing: true          # 💡 [新增] 提取前检查是否已存在特征，实现断点续传
+  inference_batch_size: 8      
+  num_workers: 0               
+  skip_existing: true          
 
-# 3. 训练与监控配置 (保持不变)
+# 3. 训练与实验管理
 # ------------------------------------------
 train:
+  experiment_name: "MoME_v2_Baseline_Y8" # 增加后缀以区分新的 ROI 范围
+  seed: 42                            
   epochs: 50
   batch_size: 32
   lr: 0.0001
-  pos_weight: 5.0
+  pos_weight: 5.0                     
   val_split: 0.2
+  modal_mask_prob: 0.3                
+
+  resume: false                       
+  resume_path: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_best.pth"
+
   save_best: true
   best_model_name: "mome_model_best.pth"
-  resume: false
-  resume_path: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_latest.pth"
   use_tensorboard: true
   sanity_check:
     ignore_corrupt: true
     min_patch_count: 5
 
-# 4. 特征维度、几何与采样参数
+# 4. 特征维度与几何参数 (校准 ROI_Y 为 [-8.0, 0])
 # ------------------------------------------
 features:
   phys: { key_name: "phys_8d", input_dim: 8 }
@@ -52,7 +57,7 @@ features:
 
 geometry:
   roi_x: [-3.0, 3.0]
-  roi_y: [-8.0, 0]
+  roi_y: [-8.0, 0.0]       # 💡 已根据要求复位
   roi_z: [-1.0, 1.0]
   patch_size: 1.0
   overlap: 0.2
@@ -64,7 +69,12 @@ sampling:
   k_z_stretch: 10.0
   trans_dim: 384
 
+# 5. 推理控制
+# ------------------------------------------
 inference:
+  mode: "random" 
+  batch_limit: 50
+  random_count: 20
+  select_files: [] 
   save_plots: true
   show_plots: false
-  batch_limit: 20
