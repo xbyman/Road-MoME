@@ -6,8 +6,8 @@
 # 1. 路径管理
 # ------------------------------------------
 paths:
-  raw_pcd_dir: "C:/Users/31078/Desktop/Road_Project/data/RSRD-sparse1"
-  raw_img_dir: "C:/Users/31078/Desktop/Road_Project/data/RSRD-sparse1"
+  raw_pcd_dir: "C:/Users/31078/Desktop/ROAD/data/RSRD-sparse1"
+  raw_img_dir: "C:/Users/31078/Desktop/ROAD/data/RSRD-sparse1"
   output_dir: "C:/Users/31078/Desktop/ROAD/data/frame_packages_full"
   
   log_dir: "C:/Users/31078/Desktop/ROAD/logs"
@@ -34,7 +34,7 @@ train:
   
   # 💡 专家屏蔽概率 (ModalMask)
   # 设为 0.2 代表 20% 概率屏蔽物理输入，强制 3D/2D 协同学习
-  modal_mask_prob: 0.2 
+  modal_mask_prob: 0.4 
 
   resume: false                       
   resume_path: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_best.pth"
