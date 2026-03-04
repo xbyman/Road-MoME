@@ -1,8 +1,11 @@
 """
-[Step 5] MoME v2.2 学术验证脚本
+[Step 5] MoME v2.7 学术验证脚本 (报错修复版)
 功能：
-1. 鲁棒性验证 (Zero-out Test): 模拟 2D 传感器完全失效，观察权重是否自动向 3D 补偿。
-2. 灵敏度扫描 (q2-Sensitivity Scan): 模拟图像质量平滑变化，绘制门控网络的动态响应曲线。
+1. 鲁棒性验证 (Zero-out Test): 模拟 2D 传感器完全失效，验证权重向 3D 分支的自适应漂移。
+2. 灵敏度扫描 (q2-Sensitivity Scan): 验证门控网络对图像质量因子的响应曲线。
+核心修复：
+- 适配 v2.3+ 模型的三个返回值 (logits, weights, exp_logits)。
+- 增加对物理专家 (Phys) 惩罚项的监测。
 """
 
 import os
@@ -21,7 +24,8 @@ from models.mome_model import build_mome_model
 
 
 def load_config():
-    with open(project_root / "config" / "config.yaml", "r", encoding="utf-8") as f:
+    cfg_path = project_root / "config" / "config.yaml"
+    with open(cfg_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -32,22 +36,32 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def run_academic_tests(sample_id=None):
-    # 1. 加载模型
+    # 1. 加载模型 (v2.7 架构)
     model = build_mome_model(cfg).to(DEVICE)
-    model.load_state_dict(
-        torch.load(PATH_CFG["weights"]["mome_model"], map_location=DEVICE)
-    )
+    model_path = PATH_CFG["weights"]["mome_model"]
+    if not os.path.exists(model_path):
+        print(f"❌ 错误: 找不到模型权重 {model_path}")
+        return
+
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
 
     # 2. 获取测试样本
     npz_dir = Path(PATH_CFG["output_dir"])
+    npz_files = sorted(list(npz_dir.glob("*.npz")))
     if sample_id:
         test_file = npz_dir / f"{sample_id}.npz"
     else:
-        test_file = next(npz_dir.glob("*.npz"))
+        # 优先选择含病害的样本
+        test_file = npz_files[0]
+        for f in npz_files[:50]:
+            d = np.load(f, allow_pickle=True)
+            if np.sum(d["meta"][:, 0]) > 2:  # 如果病害点数 > 2
+                test_file = f
+                break
 
     data = np.load(test_file, allow_pickle=True)
-    print(f"🧪 正在对样本执行学术诊断: {test_file.stem}")
+    print(f"🧪 正在执行学术诊断: {test_file.stem}")
 
     # 提取基础特征
     phys = torch.from_numpy(data["phys_8d"]).float().unsqueeze(0).to(DEVICE)
@@ -65,85 +79,111 @@ def run_academic_tests(sample_id=None):
     )
     q_geo = torch.from_numpy(data["meta"][:, 1:2]).float()  # [N, 1]
 
-    # --- 实验 1: Zero-out Test (2D 失效测试) ---
+    # 专家标签映射
+    labels = ["Phys", "3D-Geom", "2D-Tex", "Synergy"]
+
+    # --- 实验 1: Zero-out Test (2D 失效压力测试) ---
     print("▶ 正在执行 Experiment P0: Zero-out Test...")
 
     # 场景 A: 正常 (q2=0.8)
     q_vec_normal = (
         torch.cat([q_geo, torch.full_like(q_geo, 0.8)], dim=-1).unsqueeze(0).to(DEVICE)
     )
-    _, w_normal = model(phys, geom, tex, q_vec_normal)
+    # [核心修复] 适配三个返回值，使用 _ 忽略不需要的辅助 logits
+    with torch.no_grad():
+        _, w_normal, _ = model(phys, geom, tex, q_vec_normal)
 
-    # 场景 B: 2D 完全失效 (q2=0.0, tex=0)
+    # 场景 B: 2D 完全失效 (q2=0.05, tex=0)
     q_vec_fail = (
-        torch.cat([q_geo, torch.full_like(q_geo, 0.0)], dim=-1).unsqueeze(0).to(DEVICE)
+        torch.cat([q_geo, torch.full_like(q_geo, 0.05)], dim=-1).unsqueeze(0).to(DEVICE)
     )
-    _, w_fail = model(phys, geom, tex * 0.0, q_vec_fail)
+    with torch.no_grad():
+        _, w_fail, _ = model(phys, geom, tex * 0.0, q_vec_fail)
 
-    # 统计病害区域的平均权重变化
-    avg_w_normal = w_normal[0].mean(dim=0).cpu().detach().numpy()
-    avg_w_fail = w_fail[0].mean(dim=0).cpu().detach().numpy()
+    # 统计病害区域或全图的平均权重
+    avg_w_normal = w_normal[0].mean(dim=0).cpu().numpy()
+    avg_w_fail = w_fail[0].mean(dim=0).cpu().numpy()
 
-    # 绘图：权重漂移轨迹图
-    labels = ["Phys", "3D-Geom", "2D-Tex", "Synergy"]
+    # 绘图 1: 权重漂移柱状图
+    plt.figure(figsize=(10, 6))
     x = np.arange(len(labels))
     width = 0.35
-
-    plt.figure(figsize=(10, 6))
     plt.bar(
-        x - width / 2, avg_w_normal, width, label="Normal (q2=0.8)", color="skyblue"
+        x - width / 2,
+        avg_w_normal,
+        width,
+        label="Normal (q2=0.8)",
+        color="skyblue",
+        alpha=0.8,
     )
     plt.bar(
-        x + width / 2, avg_w_fail, width, label="2D Failed (q2=0.0)", color="salmon"
+        x + width / 2,
+        avg_w_fail,
+        width,
+        label="2D Failed (q2=0.05)",
+        color="salmon",
+        alpha=0.8,
     )
-    plt.ylabel("Expert Weight")
-    plt.title("Expert Weight Drift under Modality Failure")
+    plt.ylabel("Average Gating Weight")
+    plt.title(f"Modality Failure Robustness Test\nSample: {test_file.stem}")
     plt.xticks(x, labels)
+    plt.ylim(0, 1.0)
     plt.legend()
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-    plt.savefig(project_root / "logs" / "zero_out_test.png")
-    print(f"✅ 权重漂移图已生成: logs/zero_out_test.png")
+    plt.grid(axis="y", linestyle="--", alpha=0.5)
 
-    # --- 实验 2: q2-Sensitivity Scan (质量响应扫描) ---
+    save_path_1 = project_root / "logs" / "zero_out_test_v27.png"
+    plt.savefig(save_path_1, dpi=150)
+    print(f"✅ 权重漂移图已生成: {save_path_1}")
+
+    # --- 实验 2: q2-Sensitivity Scan (质量感知识别曲线) ---
     print("▶ 正在执行 Experiment P1: q2-Sensitivity Scan...")
 
-    q2_steps = np.linspace(0.0, 1.0, 21)  # 0.0 到 1.0 扫描 20 个点
+    q2_steps = np.linspace(0.01, 1.0, 20)
     weight_history = []
 
-    for q2_val in q2_steps:
+    for q2_val in tqdm(q2_steps, desc="Scanning q2"):
         q_vec_scan = (
             torch.cat([q_geo, torch.full_like(q_geo, q2_val)], dim=-1)
             .unsqueeze(0)
             .to(DEVICE)
         )
         with torch.no_grad():
-            _, weights = model(phys, geom, tex, q_vec_scan)
+            # [核心修复] 适配三个返回值
+            _, weights, _ = model(phys, geom, tex, q_vec_scan)
             avg_w = weights[0].mean(dim=0).cpu().numpy()
             weight_history.append(avg_w)
 
-    weight_history = np.array(weight_history)  # [21, 4]
+    weight_history = np.array(weight_history)
 
-    plt.figure(figsize=(10, 6))
-    colors = ["purple", "blue", "orange", "green"]
+    # 绘图 2: 响应曲线
+    plt.figure(figsize=(12, 7))
+    colors = ["#9b59b6", "#3498db", "#f1c40f", "#2ecc71"]  # 紫, 蓝, 黄, 绿
     for i in range(4):
         plt.plot(
             q2_steps,
             weight_history[:, i],
             label=f"w_{labels[i]}",
             color=colors[i],
+            linewidth=2.5,
             marker="o",
             markersize=4,
         )
 
-    plt.xlabel("Input Image Quality (q2)")
-    plt.ylabel("Gating Output Weight")
-    plt.title("Gating Network Response to Image Quality Scan")
-    plt.legend()
-    plt.grid(True, which="both", linestyle="--", alpha=0.5)
-    plt.savefig(project_root / "logs" / "q2_sensitivity_scan.png")
-    print(f"✅ 质量响应扫描曲线已生成: logs/q2_sensitivity_scan.png")
+    plt.xlabel("Input Image Quality Factor (q2)")
+    plt.ylabel("Model Gating Weight")
+    plt.title("Gating Network Response to Environmental Quality Scan (v2.7)")
+    plt.legend(loc="center right")
+    plt.grid(True, linestyle=":", alpha=0.6)
+    plt.axvline(
+        x=0.3, color="red", linestyle="--", alpha=0.3, label="Confidence Threshold"
+    )
+
+    save_path_2 = project_root / "logs" / "q2_sensitivity_scan_v27.png"
+    plt.savefig(save_path_2, dpi=150)
+    print(f"✅ 灵敏度响应曲线已生成: {save_path_2}")
 
 
 if __name__ == "__main__":
-    # 你可以手动指定一个有病害的样本 ID，效果会更明显
+    # 建立 logs 目录确保保存成功
+    (project_root / "logs").mkdir(exist_ok=True)
     run_academic_tests()

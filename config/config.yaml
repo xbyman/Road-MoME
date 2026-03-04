@@ -34,8 +34,7 @@ train:
   
   # 💡 专家屏蔽概率 (ModalMask)
   # 设为 0.2 代表 20% 概率屏蔽物理输入，强制 3D/2D 协同学习
-  modal_mask_prob: 0.4 
-
+  modal_mask_prob: 0.7
   resume: false                       
   resume_path: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_best.pth"
 

@@ -1,78 +1,74 @@
 """
-Road-MoME v2.2 - 级联调制协同架构 (FiLM + Synergy Hybrid)
-核心逻辑：
-1. FiLM Calibration: 利用 3D 几何特征生成 (1+gamma) 缩放因子，校准 2D 纹理分布。
-2. Synergy Interaction: 在校准后的空间内，计算 [f3, f2_calib, dot, diff] 产生协同特征 f_syn。
-3. Residual Prediction: 最终预测由 f_syn 主导，叠加 f3 物理残差，确保鲁棒性。
-4. Quality-aware Gating: 路由决策基于原始特征与外部物理质量因子 [q_geo, q_img]。
+Road-MoME v2.6 - 模态感知唤醒版 (完整脚本)
+核心升级：
+1. Expert 2D Calibration: 2D 专家不再观察原始图像特征，而是观察经 FiLM 校准后的几何关联特征。
+2. Multi-Path Dropout: 引入协同路径(30%)与几何路径(20%)的随机封禁，强制视觉专家（2D）在孤立状态下学习。
+3. Gate Incentive Bias: 为 2D 分支提供正向路由激励，平衡伪标签的几何偏见。
+4. Feature Synergy: 维持 v2.4 的去冗余设计，协同专家专注于跨模态一致性。
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
 
 
 class FiLMCalibrator(nn.Module):
     """
     [阶段一] 特征校准模块
-    功能：利用 3D 先验对 2D 特征进行线性调制 (去噪/对齐)
     """
 
     def __init__(self, cond_dim, target_dim):
         super().__init__()
-        # 极简两层 MLP 产生 gamma 和 beta
         self.net = nn.Sequential(
             nn.Linear(cond_dim, target_dim // 2),
             nn.GELU(),
             nn.Linear(target_dim // 2, target_dim * 2),
         )
-        # 初始化为 0，确保训练初期是恒等映射 (Identity Map)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, f3, f2):
         params = self.net(f3)
         gamma, beta = torch.chunk(params, 2, dim=-1)
-        gamma = torch.tanh(gamma) * 0.5  # 限制调制幅度
-        # 校准运算
-        f2_calibrated = (1.0 + gamma) * f2 + beta
-        return f2_calibrated
+        gamma = torch.tanh(gamma) * 0.5
+        return (1.0 + gamma) * f2 + beta
 
 
 class SynergyReasoningBlock(nn.Module):
     """
-    [阶段二] 协同推理模块
-    功能：在校准后的特征上提取高阶交互特征
+    [阶段二] 协同推理模块 (v2.4+ 极致去冗余)
     """
 
     def __init__(self, dim, low_dim=64):
         super().__init__()
-        # 采用降维设计 (BottleNeck)，防止参数量爆炸
         self.reduction = nn.Sequential(
-            nn.Linear(dim * 4, low_dim),
+            nn.Linear(dim * 2, low_dim),
             nn.LayerNorm(low_dim),
             nn.GELU(),
-            nn.Linear(low_dim, dim),  # 还原回 shared_dim
+            nn.Linear(low_dim, dim),
+            nn.LayerNorm(dim),
         )
 
     def forward(self, f3, f2_c):
-        # 显式建模一致性与冲突
-        dot_product = f3 * f2_c
-        diff = torch.abs(f3 - f2_c)
-        # 拼接产生 f_syn
-        combined = torch.cat([f3, f2_c, dot_product, diff], dim=-1)
-        f_syn = self.reduction(combined)
-        return f_syn
+        consistency = f3 * f2_c
+        conflict = torch.abs(f3 - f2_c)
+        combined = torch.cat([consistency, conflict], dim=-1)
+        return self.reduction(combined)
 
 
-class RoadMoMENetV22(nn.Module):
+class RoadMoMENetV23(nn.Module):
     def __init__(self, config):
         super().__init__()
-        d3 = config["features"]["3d"]["input_dim"]  # 384
-        d2 = config["features"]["2d"]["input_dim"]  # 768
-        shared = 128
+        d3 = config["features"]["3d"]["input_dim"]
+        d2 = config["features"]["2d"]["input_dim"]
+        shared = config.get("features", {}).get("shared_dim", 128)
 
-        # 1. 投影层
+        self.T = 2.0
+        self.penalty_scale = 1.0
+        self.syn_drop_prob = 0.3  # 协同专家丢弃概率
+        self.geom_drop_prob = 0.2  # 几何专家丢弃概率
+
         self.proj_3d = nn.Sequential(
             nn.Linear(d3, shared), nn.LayerNorm(shared), nn.GELU()
         )
@@ -80,55 +76,65 @@ class RoadMoMENetV22(nn.Module):
             nn.Linear(d2, shared), nn.LayerNorm(shared), nn.GELU()
         )
 
-        # 2. 级联引擎
-        self.film = FiLMCalibrator(d3, shared)  # 3D 调 2D
-        self.synergy = SynergyReasoningBlock(shared, low_dim=64)  # 产生协同特征
+        self.film = FiLMCalibrator(d3, shared)
+        self.synergy = SynergyReasoningBlock(shared)
 
-        # 3. 四大专家头 (注意逻辑变化)
-        self.expert_phys = nn.Linear(8, 1)  # 原始物理专家
-        self.expert_geom = nn.Linear(shared, 1)  # 纯几何语义专家
-        self.expert_tex = nn.Linear(shared, 1)  # 纯纹理语义专家 (调制前)
-        self.expert_syn = nn.Linear(shared, 1)  # [核心] 协同专家
+        self.expert_phys = nn.Linear(8, 1)
+        self.expert_geom = nn.Linear(shared, 1)
+        self.expert_tex = nn.Linear(shared, 1)
+        self.expert_syn = nn.Linear(shared, 1)
 
-        # 4. 增强型门控 (接收特征 + 物理质量分 q_geo, q_img)
         self.gating_net = nn.Sequential(
-            nn.Linear(shared * 2 + 2, 64),
-            nn.ReLU(),
-            nn.Linear(64, 4),
-            nn.Softmax(dim=-1),
+            nn.Linear(shared * 2 + 2, 64), nn.ReLU(), nn.Linear(64, 4)
         )
 
     def forward(self, phys, geom, tex, quality_vec):
         B, N, _ = phys.shape
         f3_raw = geom.view(B * N, -1)
         f2_raw = tex.expand(B, N, -1).reshape(B * N, -1)
+        q_in = quality_vec.view(B * N, -1)
 
-        # --- 级联流水线 ---
-        # (1) 基础特征提取
+        # --- (A) 特征加工 ---
         f3_h = self.proj_3d(f3_raw)
         f2_h = self.proj_2d(f2_raw)
-
-        # (2) FiLM 校准: 用原始 3D 引导投影后的 2D
-        f2_calib = self.film(f3_raw, f2_h)
-
-        # (3) Synergy 交互: 产生新特征 f_syn
+        f2_calib = self.film(f3_raw, f2_h)  # 关键：3D引导校准后的视觉特征
         f_syn = self.synergy(f3_h, f2_calib)
 
-        # --- 路由决策 ---
-        q_in = quality_vec.view(B * N, -1)  # [q_geo, q_img]
-        gate_input = torch.cat([f3_h, f2_h, q_in], dim=-1)
-        weights = self.gating_net(gate_input)
-
-        # --- 专家结论 ---
+        # --- (B) 计算专家结论 ---
         l_p = self.expert_phys(phys.view(B * N, -1))
         l_g = self.expert_geom(f3_h)
-        l_t = self.expert_tex(f2_h)
+        # [v2.6 改进] 2D专家现在基于“已校准特征”预测，增强其对病害几何分布的敏感度
+        l_t = self.expert_tex(f2_calib)
+        l_s = self.expert_syn(f_syn)
 
-        # [学术改进] 协同结论使用残差连接: f_syn_logit + f3_logit
-        # 即使校准完全失效，协同专家也能保留 3D 的基本判定
-        l_s = self.expert_syn(f_syn) + 0.5 * l_g
+        # --- (C) 路由决策 ---
+        gate_input = torch.cat([f3_h, f2_h, q_in], dim=-1)
+        gate_logits = self.gating_net(gate_input)
 
-        # --- 加权融合 ---
+        # 1. 物理抑制
+        gate_logits[:, 0:1] += torch.log(torch.tensor([0.2], device=phys.device))
+
+        # [v2.6 改进] 路由激励：给 2D 专家 2.0 的初始 Logit 奖励，抵消 3D 标签偏见
+        # 索引 2 为 2D-Tex
+        gate_logits[:, 2:3] += 2.0
+
+        # 2. 质量硬约束
+        q_geo, q_img = q_in[:, 0:1], q_in[:, 1:2]
+        gate_logits[:, 1:2] += self.penalty_scale * torch.log(q_geo + 1e-6)
+        gate_logits[:, 2:3] += self.penalty_scale * torch.log(q_img + 1e-6)
+        gate_logits[:, 3:4] += self.penalty_scale * torch.log(q_geo * q_img + 1e-6)
+
+        # [v2.6 改进] 复合路径丢弃策略 (仅在训练模式下)
+        if self.training:
+            rand_val = random.random()
+            if rand_val < self.syn_drop_prob:
+                gate_logits[:, 3:4] -= 1e9  # 封禁协同
+            elif rand_val < self.syn_drop_prob + self.geom_drop_prob:
+                gate_logits[:, 1:2] -= 1e9  # 封禁 3D 几何，逼迫模型学习 2D 纹理
+
+        weights = F.softmax(gate_logits / self.T, dim=-1)
+
+        # --- (D) 结果合成 ---
         final_logit = (
             weights[:, 0:1] * l_p
             + weights[:, 1:2] * l_g
@@ -136,8 +142,14 @@ class RoadMoMENetV22(nn.Module):
             + weights[:, 3:4] * l_s
         )
 
-        return final_logit.view(B, N), weights.view(B, N, 4)
+        expert_logits = torch.cat([l_p, l_g, l_t, l_s], dim=-1)
+
+        return (
+            final_logit.view(B, N),
+            weights.view(B, N, 4),
+            expert_logits.view(B, N, 4),
+        )
 
 
 def build_mome_model(config):
-    return RoadMoMENetV22(config)
+    return RoadMoMENetV23(config)
