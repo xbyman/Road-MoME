@@ -1,79 +1,77 @@
-# ==========================================
-# 路面多模态协同异常检测 (MoME) 全局配置
-# 版本: v3.3 (协同版专用校准)
-# ==========================================
+# ==============================================================================
+# Road-MoME 全局配置文件 (v3.3 深度协同与不确定性版)
+# ==============================================================================
 
 # 1. 路径管理
-# ------------------------------------------
+# ------------------------------------------------------------------------------
 paths:
   raw_pcd_dir: "C:/Users/31078/Desktop/ROAD/data/RSRD-sparse1"
   raw_img_dir: "C:/Users/31078/Desktop/ROAD/data/RSRD-sparse1"
   output_dir: "C:/Users/31078/Desktop/ROAD/data/frame_packages_full"
-  
+  manual_label_path: "C:/Users/31078/Desktop/ROAD/data/manual_visual_gt.json"
   log_dir: "C:/Users/31078/Desktop/ROAD/logs"
   checkpoint_dir: "C:/Users/31078/Desktop/ROAD/pretrained_models"
-  vis_output_dir: "C:/Users/31078/Desktop/ROAD/data/inference_vis_full"
-  
+  vis_output_dir: "C:/Users/31078/Desktop/ROAD/data/inference_vis_v28"
   weights:
     point_mae: "C:/Users/31078/Desktop/ROAD/pretrained_models/pretrain.pth"
     dinov2: "C:/Users/31078/Desktop/ROAD/pretrained_models/dinov2_vitb14_pretrain.pth"
-    # 💡 训练完成后，确认此路径指向最新的 best 模型
     mome_model: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_best.pth"
 
-# 2. 训练配置 (针对协同专家调优)
-# ------------------------------------------
+# 2. 训练配置
+# ------------------------------------------------------------------------------
 train:
-  experiment_name: "MoME_v2_Synergy_Full" # 每次新实验建议修改此名称
-  seed: 42                            
-  
-  epochs: 50
-  batch_size: 32
-  lr: 0.0001
-  pos_weight: 5.0                     
-  val_split: 0.2
-  
-  # 💡 专家屏蔽概率 (ModalMask)
-  # 设为 0.2 代表 20% 概率屏蔽物理输入，强制 3D/2D 协同学习
-  modal_mask_prob: 0.7
-  resume: false                       
-  resume_path: "C:/Users/31078/Desktop/ROAD/pretrained_models/mome_model_best.pth"
-
+  experiment_name: "MoME_v2.8_Uncertainty_GT_Full"
+  seed: 42
+  epochs: 60
+  batch_size: 16
+  lr: 0.00005
+  pos_weight: 5.0
+  val_split: 0.15
+  lambda_vis: 2.5
+  mu_consistency: 1.2
+  gamma_uncertainty: 0.15
+  modal_mask_prob: 0.3
+  resume: false
   save_best: true
-  best_model_name: "mome_model_best.pth"
-  use_tensorboard: true
-  sanity_check:
-    ignore_corrupt: true
-    min_patch_count: 5
 
-# 3. 特征维度与几何参数 (校准 ROI_Y 为 [-8.0, 0])
-# ------------------------------------------
+# 3. 特征维度
+# ------------------------------------------------------------------------------
 features:
   phys: { key_name: "phys_8d", input_dim: 8 }
   3d:   { key_name: "deep_512d", input_dim: 384 }
   2d:   { key_name: "deep_2d_768d", input_dim: 768 }
-  # 协同特征在模型内部对齐至 128 维，此处作为参考
   shared_dim: 128 
 
+# 4. 几何与空间参数
+# ------------------------------------------------------------------------------
 geometry:
   roi_x: [-3.0, 3.0]
   roi_y: [-8.0, 0.0]
-  roi_z: [-1.0, 1.0]
   patch_size: 1.0
   overlap: 0.2
   th_anomaly: 0.035
   sigma_q: 0.015
+  max_patches: 81      
 
+# 5. 点云采样规格
+# ------------------------------------------------------------------------------
 sampling:
   n_points: 8192
   k_z_stretch: 10.0
   trans_dim: 384
 
-# 4. 推理控制
-# ------------------------------------------
+# 6. 推理与诊断控制 (此处为选择指定图片的关键配置)
+# ------------------------------------------------------------------------------
 inference:
-  mode: "random" 
-  batch_limit: 50
-  random_count: 20
-  select_files: [] 
+  # mode 可选: "random" (随机抽样), "sequential" (按顺序), "select" (手动指定)
+  mode: "select"       
+  batch_limit: 15
+  # 当 mode 为 "select" 时，填入文件名中的时间戳 ID (例如你标注过的那几张)
+  select_files: 
+    - "20230317075058.400"
+    - "20230408023521.600"
+    - "20230408031709.000"
+    - "20230406014501.600"
+  q2_default: 0.8
   save_plots: true
   show_plots: false
